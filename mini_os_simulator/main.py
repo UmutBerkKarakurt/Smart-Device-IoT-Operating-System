@@ -1,4 +1,4 @@
-"""Entry point: Phase 1 demo by default; ``--phase0`` runs Phase 0 only."""
+"""Entry point: Phase 2 demo by default; ``--phase0`` / ``--phase1`` for earlier phases."""
 
 from __future__ import annotations
 
@@ -12,7 +12,10 @@ def main() -> None:
     if "--phase0" in sys.argv:
         sim.run_phase0_demo()
         return
-    sim.run_phase1_demo()
+    if "--phase1" in sys.argv:
+        sim.run_phase1_demo()
+        return
+    sim.run_phase2_demo()
 
 
 if __name__ == "__main__":

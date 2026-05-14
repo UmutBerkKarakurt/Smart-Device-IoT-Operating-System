@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 class ProcessState(Enum):
@@ -26,6 +26,8 @@ class PCB:
     cpu_burst_time: int = 0
     remaining_time: int = 0
     opened_files: List[str] = field(default_factory=list)
+    # Phase 2: demand-paged logical pages resident in physical frames (logical_page -> frame_index).
+    page_table: Dict[int, int] = field(default_factory=dict)
     # Scheduling metrics (abstract simulation ticks)
     arrival_time: int = 0
     start_time: Optional[int] = None

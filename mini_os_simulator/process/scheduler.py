@@ -38,6 +38,9 @@ class Scheduler:
             if pcb.state == ProcessState.TERMINATED:
                 _log(f"pick_next: skip terminated pid={pid}")
                 continue
+            if pcb.state == ProcessState.BLOCKED:
+                _log(f"pick_next: skip blocked pid={pid}")
+                continue
             _log(f"Picked next pid={pid} name={pcb.name!r}")
             return pcb
         _log("pick_next: ready queue empty")
