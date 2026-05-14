@@ -6,6 +6,18 @@ from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional
 
 from os_core.logger import get_logger
+from os_core.observability import (
+    EventCategory,
+    SystemEvent,
+    SystemMetricsDashboard,
+    analyze_system,
+    collect_average_metrics_from_pcbs,
+    format_analysis_report,
+    format_grouped_timeline,
+    format_metrics_table,
+    print_log_category_banner,
+    scheduler_policy_comparison_text,
+)
 from concurrency.locks import Lock
 from concurrency.semaphore import CountingSemaphore
 from concurrency.shared_buffer import SharedBuffer
@@ -87,12 +99,71 @@ class Simulation:
         self.aging_interval: int = 5
         # When True, SyncPorts wires mutex inheritance callbacks into ``Lock`` operations.
         self.mutex_inheritance_enabled: bool = False
+        # Final phase: timeline + metrics (deterministic; safe to leave enabled).
+        self.presentation_mode: bool = False
+        self.record_system_events: bool = True
+        self.timeline_max_events: int = 2000
+        self._system_events: List[SystemEvent] = []
+        self._metrics_dashboard = SystemMetricsDashboard()
+        self.processes.state_change_hook = self._obs_on_process_state_change
         self._wire_memory_ports()
+
+    def _obs_reset(self) -> None:
+        self._system_events.clear()
+        self._metrics_dashboard.reset()
+
+    def _obs_record(
+        self,
+        category: EventCategory,
+        event_type: str,
+        description: str,
+        *related_pids: int,
+    ) -> None:
+        if not self.record_system_events:
+            return
+        tick = self._sim_clock
+        evt = SystemEvent(
+            tick=tick,
+            category=category,
+            event_type=event_type,
+            description=description,
+            related_pids=tuple(related_pids),
+        )
+        self._system_events.append(evt)
+        if self.timeline_max_events > 0 and len(self._system_events) > self.timeline_max_events:
+            overflow = len(self._system_events) - self.timeline_max_events
+            del self._system_events[0:overflow]
+
+    def _obs_on_process_state_change(self, pid: int, old: ProcessState, new: ProcessState) -> None:
+        if old == new:
+            return
+        if new == ProcessState.BLOCKED:
+            self._metrics_dashboard.total_blocked_transitions += 1
+            self._metrics_dashboard.blocked_by_pid[pid] += 1
+            self._obs_record("PROCESS", "BLOCKED", f"pid={pid} -> BLOCKED (from {old.name})", pid)
+        elif new == ProcessState.READY and old == ProcessState.BLOCKED:
+            self._obs_record("PROCESS", "READY", f"pid={pid} BLOCKED -> READY", pid)
+
+    def _print_banner(self, title: str) -> None:
+        line = "=" * max(20, len(title) + 8)
+        _log(line)
+        _log(f"  {title}")
+        _log(line)
 
     def _wire_memory_ports(self) -> None:
         self.memory.ports.clear_page_mapping = self._memory_clear_mapping
         self.memory.ports.install_page_mapping = self._memory_install_mapping
         self.memory.ports.mark_ready_and_enqueue = self._memory_ready_after_fault
+        self.memory.ports.on_fifo_eviction = self._memory_on_fifo_eviction
+
+    def _memory_on_fifo_eviction(self, victim_pid: int, logical_page: int, frame_idx: int) -> None:
+        self._metrics_dashboard.total_page_replacements += 1
+        self._obs_record(
+            "MEMORY",
+            "PAGE_REPLACEMENT",
+            f"FIFO evict pid={victim_pid} page={logical_page} frame={frame_idx}",
+            victim_pid,
+        )
 
     def _memory_clear_mapping(self, pid: int, logical_page: int) -> None:
         pcb = self.processes.get_process(pid)
@@ -155,11 +226,24 @@ class Simulation:
                     mx = max(mx, w.priority + w.aging_bonus)
             owner.mutex_inheritance_floor = mx
         if owner.mutex_inheritance_floor > prev:
+            self._metrics_dashboard.total_priority_inheritance_activations += 1
+            self._obs_record(
+                "PRIORITY",
+                "INHERITANCE",
+                f"lock={lock.name!r} holder pid={owner_pid} floor {prev}->{owner.mutex_inheritance_floor}",
+                owner_pid,
+            )
             _conc(
                 f"{lock.name}: priority inheritance -> holder pid={owner_pid} "
                 f"inherits floor={owner.mutex_inheritance_floor} (was {prev})"
             )
         elif prev > 0 and owner.mutex_inheritance_floor == 0:
+            self._obs_record(
+                "PRIORITY",
+                "INHERITANCE_CLEAR",
+                f"lock={lock.name!r} holder pid={owner_pid} floor cleared (was {prev})",
+                owner_pid,
+            )
             _conc(
                 f"{lock.name}: priority inheritance cleared for holder pid={owner_pid} "
                 f"(floor was {prev})"
@@ -190,6 +274,13 @@ class Simulation:
             if pcb.state != ProcessState.READY:
                 continue
             pcb.aging_bonus += 1
+            self._metrics_dashboard.total_aging_events += 1
+            self._obs_record(
+                "PRIORITY",
+                "AGING",
+                f"pid={pcb.pid} aging_bonus={pcb.aging_bonus} effective_priority={pcb.effective_priority}",
+                pcb.pid,
+            )
             _sch(f"Aging applied pid={pcb.pid} effective_priority={pcb.effective_priority}")
 
     def _advance_sim_clock(self) -> None:
@@ -199,18 +290,54 @@ class Simulation:
         def log_s(msg: str) -> None:
             _sch(msg)
 
-        if self.mutex_inheritance_enabled:
-            return SyncPorts(
-                block_process=self._sync_block_process,
-                wake_process=self._sync_wake_process,
-                log_scheduler=log_s,
-                recompute_mutex_inheritance=self._recompute_mutex_inheritance,
-                clear_mutex_inheritance_for_holder=self._clear_mutex_inheritance_for_holder,
-            )
-        return SyncPorts(
+        common = dict(
             block_process=self._sync_block_process,
             wake_process=self._sync_wake_process,
             log_scheduler=log_s,
+            on_semaphore_blocked=self._obs_on_semaphore_blocked,
+            on_semaphore_signal_handoff=self._obs_on_semaphore_signal_handoff,
+            on_mutex_blocked=self._obs_on_mutex_blocked,
+        )
+        if self.mutex_inheritance_enabled:
+            return SyncPorts(
+                **common,
+                recompute_mutex_inheritance=self._recompute_mutex_inheritance,
+                clear_mutex_inheritance_for_holder=self._clear_mutex_inheritance_for_holder,
+            )
+        return SyncPorts(**common)
+
+    def _obs_on_semaphore_blocked(self, name: str, pid: int) -> None:
+        self._metrics_dashboard.total_semaphore_waits += 1
+        self._obs_record("CONCURRENCY", "SEMAPHORE_WAIT", f"{name}: pid={pid} blocked", pid)
+
+    def _obs_on_semaphore_signal_handoff(self, name: str, signaler: int, wakee: int) -> None:
+        self._obs_record(
+            "CONCURRENCY",
+            "SEMAPHORE_SIGNAL",
+            f"{name}: pid={signaler} handoff -> pid={wakee}",
+            signaler,
+            wakee,
+        )
+
+    def _obs_on_mutex_blocked(self, name: str, waiter: int, owner: int) -> None:
+        self._metrics_dashboard.total_lock_contentions += 1
+        self._obs_record(
+            "CONCURRENCY",
+            "MUTEX_WAIT",
+            f"{name}: waiter pid={waiter} owner pid={owner}",
+            waiter,
+            owner,
+        )
+
+    def _obs_on_file_lock_blocked(self, path: str, waiter: int, holder: int) -> None:
+        self._metrics_dashboard.total_lock_contentions += 1
+        self._metrics_dashboard.file_lock_contention_by_path[path] += 1
+        self._obs_record(
+            "FILESYSTEM",
+            "FILE_LOCK_WAIT",
+            f"path={path!r} waiter pid={waiter} holder pid={holder}",
+            waiter,
+            holder,
         )
 
     def _make_fs_ports(self) -> FileSystemPorts:
@@ -221,6 +348,7 @@ class Simulation:
             block_process=self._sync_block_process,
             wake_process=self._sync_wake_process,
             log_scheduler=log_s,
+            on_file_lock_blocked=self._obs_on_file_lock_blocked,
         )
 
     def _advance_file_io_timers(self) -> None:
@@ -238,6 +366,13 @@ class Simulation:
     def _complete_file_io(self, job: PendingFileIoJob) -> None:
         ports = self._make_fs_ports()
         _sch(f"pid={job.pid} I/O complete op={job.op} path={job.path!r}")
+        self._metrics_dashboard.total_file_io_completed += 1
+        self._obs_record(
+            "FILESYSTEM",
+            "IO_COMPLETE",
+            f"pid={job.pid} op={job.op} path={job.path!r}",
+            job.pid,
+        )
         if job.op == "write":
             self.fs.write(job.path, job.payload or "", writer_pid=job.pid)
         elif job.op == "append":
@@ -298,6 +433,7 @@ class Simulation:
         self._pending_file_io.append(
             PendingFileIoJob(ticks_remaining=ticks, pid=pid, path=p, op="write", payload=content)
         )
+        self._obs_record("FILESYSTEM", "IO_QUEUED", f"pid={pid} op=write path={p!r} ticks={ticks}", pid)
         _log(f"I/O queued pid={pid} op=write path={p!r} io_ticks={ticks}")
         _sch(f"pid={pid} blocked for I/O ({ticks} ticks) op=write path={p!r}")
         self._sync_block_process(pid)
@@ -317,6 +453,7 @@ class Simulation:
         self._pending_file_io.append(
             PendingFileIoJob(ticks_remaining=ticks, pid=pid, path=p, op="append", payload=fragment)
         )
+        self._obs_record("FILESYSTEM", "IO_QUEUED", f"pid={pid} op=append path={p!r} ticks={ticks}", pid)
         _log(f"I/O queued pid={pid} op=append path={p!r} io_ticks={ticks}")
         _sch(f"pid={pid} blocked for I/O ({ticks} ticks) op=append path={p!r}")
         self._sync_block_process(pid)
@@ -336,6 +473,7 @@ class Simulation:
         self._pending_file_io.append(
             PendingFileIoJob(ticks_remaining=ticks, pid=pid, path=p, op="read", payload=None)
         )
+        self._obs_record("FILESYSTEM", "IO_QUEUED", f"pid={pid} op=read path={p!r} ticks={ticks}", pid)
         _log(f"I/O queued pid={pid} op=read path={p!r} io_ticks={ticks}")
         _sch(f"pid={pid} blocked for I/O ({ticks} ticks) op=read path={p!r}")
         self._sync_block_process(pid)
@@ -355,6 +493,7 @@ class Simulation:
         self._pending_file_io.append(
             PendingFileIoJob(ticks_remaining=ticks, pid=pid, path=p, op="delete", payload=None)
         )
+        self._obs_record("FILESYSTEM", "IO_QUEUED", f"pid={pid} op=delete path={p!r} ticks={ticks}", pid)
         _log(f"I/O queued pid={pid} op=delete path={p!r} io_ticks={ticks}")
         _sch(f"pid={pid} blocked for I/O ({ticks} ticks) op=delete path={p!r}")
         self._sync_block_process(pid)
@@ -369,6 +508,36 @@ class Simulation:
         self._pending_file_io.clear()
         self._open_by_fd.clear()
         self._next_fd = 1
+        self._obs_reset()
+
+    def print_scheduler_policy_comparison(self) -> None:
+        """Educational static comparison (see also ``run_phase1_demo`` for live metrics)."""
+        text = scheduler_policy_comparison_text()
+        for line in text.splitlines():
+            _log(line)
+
+    def print_system_metrics_dashboard(self) -> None:
+        aw, at, ar = collect_average_metrics_from_pcbs(self.processes.list_processes())
+        format_metrics_table(self._metrics_dashboard, avg_waiting=aw, avg_turnaround=at, avg_response=ar, sink=_log)
+
+    def print_grouped_timeline(self, *, max_events: int = 120) -> None:
+        format_grouped_timeline(self._system_events, sink=_log, max_events=max_events)
+
+    def print_grouped_log_banners(self) -> None:
+        """Presentation helper: category headers (timeline still holds detail)."""
+        print_log_category_banner("SCHEDULER EVENTS", sink=_log)
+        print_log_category_banner("MEMORY EVENTS", sink=_log)
+        print_log_category_banner("FILESYSTEM EVENTS", sink=_log)
+        print_log_category_banner("CONCURRENCY EVENTS", sink=_log)
+        print_log_category_banner("PRIORITY EVENTS", sink=_log)
+
+    def print_system_analysis(self, *, policy_label: str = "") -> None:
+        analysis = analyze_system(
+            self._system_events,
+            self._metrics_dashboard,
+            policy_label=policy_label,
+        )
+        format_analysis_report(analysis, sink=_log)
 
     def _phase4_cpu_ticks(self, ticks: int) -> None:
         """Advance simulation (CPU + fault timers + file I/O timers) for a fixed tick budget."""
@@ -384,6 +553,8 @@ class Simulation:
     def _note_context_switch_if_needed(self, pid: int, name: str) -> None:
         if self._cs_prev_pid != pid:
             self.context_switches += 1
+            self._metrics_dashboard.total_context_switches += 1
+            self._obs_record("SCHEDULER", "CONTEXT_SWITCH", f"pid={pid} name={name!r} RUNNING", pid)
             _sch(f"Context switch: pid={pid} {name} RUNNING")
         self._cs_prev_pid = pid
 
@@ -407,6 +578,13 @@ class Simulation:
                     return False
                 self._current_pcb = pcb
                 self._ticks_in_slice = 0
+                self._metrics_dashboard.total_scheduler_dispatches += 1
+                self._obs_record(
+                    "SCHEDULER",
+                    "DISPATCH",
+                    f"selected pid={pcb.pid} name={pcb.name!r}",
+                    pcb.pid,
+                )
 
             pcb = self._current_pcb
             if self._ticks_in_slice == 0:
@@ -424,6 +602,14 @@ class Simulation:
                 )
                 acc = self.memory.try_access(pcb.pid, la, pcb.page_table)
                 if acc.kind == "fault":
+                    self._metrics_dashboard.total_page_faults += 1
+                    self._metrics_dashboard.page_faults_by_pid[pcb.pid] += 1
+                    self._obs_record(
+                        "MEMORY",
+                        "PAGE_FAULT",
+                        f"pid={pcb.pid} logical_page={acc.logical_page}",
+                        pcb.pid,
+                    )
                     _sch(f"pid={pcb.pid} BLOCKED on page fault (page={acc.logical_page})")
                     self.processes.change_state(pcb.pid, ProcessState.BLOCKED)
                     self.memory.begin_fault_resolution(pcb.pid, acc.logical_page)
@@ -1137,3 +1323,124 @@ class Simulation:
         _log(row(m_off))
         _log(row(m_on))
         _log("=== Phase 5 demo end ===")
+
+    def run_final_demo(self) -> None:
+        """
+        Final integration: PriorityScheduler + paging + FS I/O + producer/consumer
+        + mutex inversion/inheritance + file-lock contention + aging + observability output.
+        Mutates this ``Simulation`` instance (same pattern as Phase 3–5 narrative demos).
+        """
+        was_pm = self.presentation_mode
+        self.presentation_mode = True
+        _log("=== FINAL INTEGRATED DEMO (Phase 6 — integration + observability) ===")
+        self._print_banner("FINAL INTEGRATED DEMO — Mini IoT OS Under Stress")
+
+        self.enable_memory_access = True
+        self.priority_aging_enabled = True
+        self.aging_interval = 4
+        self.mutex_inheritance_enabled = True
+        self.file_io_ticks = 2
+        self.memory.fault_handling_ticks = 3
+        self.scheduler = create_scheduler("priority")
+        self._reset_cpu_execution_state()
+        self.fs.set_simulation_tick(self._sim_clock)
+        assert self.fs.mkdir("/logs", creator_pid=0)
+        assert self.fs.mkdir("/data", creator_pid=0)
+        assert self.fs.create("/logs/temperature.log", creator_pid=0)
+        assert self.fs.create("/data/shared.txt", creator_pid=0)
+
+        dl = self.processes.create_process(
+            "DataLoggerProcess",
+            priority=1,
+            memory_required=256,
+            cpu_burst_time=24,
+            arrival_time=self._sim_clock,
+        )
+        net = self.processes.create_process(
+            "NetworkSyncProcess",
+            priority=2,
+            memory_required=256,
+            cpu_burst_time=24,
+            arrival_time=self._sim_clock,
+        )
+        alarm = self.processes.create_process(
+            "AlarmMonitorProcess",
+            priority=3,
+            memory_required=128,
+            cpu_burst_time=24,
+            arrival_time=self._sim_clock,
+        )
+        cam = self.processes.create_process(
+            "CameraProcess",
+            priority=2,
+            memory_required=256,
+            cpu_burst_time=16,
+            arrival_time=self._sim_clock,
+        )
+
+        for p in (dl, net, alarm, cam):
+            if not self.memory.allocate(p.pid, p.memory_required):
+                _log(f"final demo: memory allocation failed for pid={p.pid}")
+
+        for p in (dl, net, alarm, cam):
+            self.processes.change_state(p.pid, ProcessState.READY)
+            self.scheduler.enqueue(p)
+
+        buf = SharedBuffer[str](2, name="final_iot_buffer")
+        mtx = Lock("final_buffer_mutex")
+        empty = CountingSemaphore("empty_slots", 2)
+        full = CountingSemaphore("full_slots", 0)
+        ports = self._make_sync_ports()
+
+        def produce_frame(pid: int, tag: str) -> None:
+            assert empty.wait(pid, ports)
+            assert mtx.acquire(pid, ports)
+            buf.produce(tag)
+            mtx.release(pid, ports)
+            full.signal(pid, ports)
+
+        def consume_frame(pid: int) -> None:
+            assert full.wait(pid, ports)
+            assert mtx.acquire(pid, ports)
+            buf.consume()
+            mtx.release(pid, ports)
+            empty.signal(pid, ports)
+
+        self._print_banner("SCENARIO — Producer / consumer (bounded buffer + P/V)")
+        produce_frame(cam.pid, "capture-A")
+        produce_frame(cam.pid, "capture-B")
+        assert not empty.wait(cam.pid, ports)
+        self._phase5_cpu_ticks(5)
+        consume_frame(dl.pid)
+        assert empty.wait(cam.pid, ports)
+        assert mtx.acquire(cam.pid, ports)
+        buf.produce("capture-C")
+        mtx.release(cam.pid, ports)
+        full.signal(cam.pid, ports)
+
+        self._print_banner("SCENARIO — Priority inversion + inheritance (sensor_lock)")
+        sensor = Lock("sensor_lock")
+        assert sensor.acquire(dl.pid, None) is True
+        assert sensor.acquire(alarm.pid, ports) is False
+
+        self._print_banner("SCENARIO — File I/O blocking + file lock contention")
+        assert self.file_blocking_append(dl.pid, "/data/shared.txt", "telemetry=1\n") == "io_started"
+        assert self.file_blocking_read(net.pid, "/data/shared.txt") == "lock_blocked"
+
+        self._print_banner("SCENARIO — CPU + paging + interleaved I/O completion")
+        self._phase5_cpu_ticks(45)
+
+        self._print_banner("SCENARIO — Scripted sensor_lock release + drain to termination")
+        assert sensor.release(dl.pid, ports) is True
+        self._phase5_cpu_ticks(30)
+        self._run_until_all_terminated()
+
+        self.presentation_mode = was_pm
+
+        self._print_banner("GROUPED LOG CATEGORIES (detail follows in timeline)")
+        self.print_grouped_log_banners()
+        self.print_grouped_timeline(max_events=100)
+        self.print_system_metrics_dashboard()
+        self.print_system_analysis(policy_label="Priority + inheritance + aging (final demo)")
+        self.print_scheduler_policy_comparison()
+        _log("=== FINAL INTEGRATED DEMO end ===")

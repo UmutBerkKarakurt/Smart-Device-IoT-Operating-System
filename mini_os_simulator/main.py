@@ -1,4 +1,4 @@
-"""Entry point: Phase 5 demo by default; ``--phase0`` … ``--phase4`` for earlier phases."""
+"""Entry point: Phase 5 demo by default; ``--final`` / ``--phase6`` for integrated final demo."""
 
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ def main() -> None:
         return
     if "--phase4" in sys.argv:
         sim.run_phase4_demo()
+        return
+    if "--final" in sys.argv or "--phase6" in sys.argv:
+        sim.run_final_demo()
         return
     sim.run_phase5_demo()
 

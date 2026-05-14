@@ -19,3 +19,7 @@ class SyncPorts:
     # Phase 5: optional priority inheritance (Phase 3 leaves these as None).
     recompute_mutex_inheritance: Optional[Callable[["Lock"], None]] = None
     clear_mutex_inheritance_for_holder: Optional[Callable[[int], None]] = None
+    # Final phase: optional observability hooks (no effect when None).
+    on_semaphore_blocked: Optional[Callable[[str, int], None]] = None
+    on_semaphore_signal_handoff: Optional[Callable[[str, int, int], None]] = None
+    on_mutex_blocked: Optional[Callable[[str, int, int], None]] = None

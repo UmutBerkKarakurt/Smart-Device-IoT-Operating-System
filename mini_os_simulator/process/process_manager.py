@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from os_core.logger import get_logger
 from process.pcb import PCB, ProcessState
@@ -14,6 +14,7 @@ class ProcessManager:
     def __init__(self) -> None:
         self._processes: Dict[int, PCB] = {}
         self._next_pid: int = 1
+        self.state_change_hook: Optional[Callable[[int, ProcessState, ProcessState], None]] = None
 
     def pid_table(self) -> Dict[int, PCB]:
         """Mutable map used by the scheduler to resolve ready-queue ids."""
@@ -59,6 +60,8 @@ class ProcessManager:
         old = pcb.state
         pcb.state = new_state
         _log(f"pid={pid} state {old.name} -> {new_state.name}")
+        if self.state_change_hook is not None:
+            self.state_change_hook(pid, old, new_state)
         return True
 
     def terminate(self, pid: int) -> bool:

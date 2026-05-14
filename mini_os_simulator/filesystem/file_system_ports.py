@@ -13,3 +13,4 @@ class FileSystemPorts:
     block_process: Callable[[int], None]
     wake_process: Callable[[int], None]
     log_scheduler: Optional[Callable[[str], None]] = None
+    on_file_lock_blocked: Optional[Callable[[str, int, int], None]] = None

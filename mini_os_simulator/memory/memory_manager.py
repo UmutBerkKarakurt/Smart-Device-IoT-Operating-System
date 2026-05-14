@@ -53,6 +53,7 @@ class MemoryPorts:
         self.clear_page_mapping: Optional[Callable[[int, int], None]] = None
         self.install_page_mapping: Optional[Callable[[int, int, int], None]] = None
         self.mark_ready_and_enqueue: Optional[Callable[[int], None]] = None
+        self.on_fifo_eviction: Optional[Callable[[int, int, int], None]] = None
 
 
 class MemoryManager:
@@ -290,6 +291,8 @@ class MemoryManager:
             f"FIFO replacement: evict pid={victim.pid} page={victim.logical_page} "
             f"from frame {best_idx} (load_seq={victim.load_seq})"
         )
+        if self.ports.on_fifo_eviction is not None:
+            self.ports.on_fifo_eviction(victim.pid, victim.logical_page, best_idx)
         self._frame_table[best_idx] = None
         if self.ports.clear_page_mapping:
             self.ports.clear_page_mapping(victim.pid, victim.logical_page)

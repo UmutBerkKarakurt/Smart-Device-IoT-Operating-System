@@ -50,6 +50,10 @@ class Lock:
         if ports.log_scheduler:
             ports.log_scheduler(f"sync: pid={pid} waiting on mutex {self.name!r}")
         ports.block_process(pid)
+        if ports.on_mutex_blocked is not None:
+            owner = self._owner
+            if owner is not None:
+                ports.on_mutex_blocked(self.name, pid, owner)
         recomp = getattr(ports, "recompute_mutex_inheritance", None)
         if recomp is not None:
             recomp(self)

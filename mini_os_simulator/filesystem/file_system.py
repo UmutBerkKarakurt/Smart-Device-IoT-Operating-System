@@ -235,6 +235,8 @@ class FileSystem:
             if ports.log_scheduler:
                 ports.log_scheduler(f"pid={pid} blocked on file lock waiting for {p!r}")
             ports.block_process(pid)
+            if ports.on_file_lock_blocked is not None:
+                ports.on_file_lock_blocked(p, pid, inode.lock_owner)
         return False
 
     def release_exclusive_lock(self, pid: int, path: str, ports: Optional["FileSystemPorts"] = None) -> None:

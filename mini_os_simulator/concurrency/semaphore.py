@@ -56,6 +56,8 @@ class CountingSemaphore:
         if ports.log_scheduler:
             ports.log_scheduler(f"sync: pid={pid} blocked on semaphore {self.name!r}")
         ports.block_process(pid)
+        if ports.on_semaphore_blocked is not None:
+            ports.on_semaphore_blocked(self.name, pid)
         return False
 
     def signal(self, pid: int, ports: SyncPorts) -> None:
@@ -70,6 +72,8 @@ class CountingSemaphore:
             if ports.log_scheduler:
                 ports.log_scheduler(f"sync: semaphore {self.name!r} signal -> wake pid={wakee}")
             ports.wake_process(wakee)
+            if ports.on_semaphore_signal_handoff is not None:
+                ports.on_semaphore_signal_handoff(self.name, pid, wakee)
             return
         self._count += 1
         _log(f"{self.name}: signal by pid={pid} count_after={self._count}")
