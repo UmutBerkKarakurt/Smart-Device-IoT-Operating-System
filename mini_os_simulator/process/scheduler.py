@@ -1,4 +1,4 @@
-"""Ready-queue schedulers: FIFO baseline and optional round-robin quantum."""
+"""Ready-queue schedulers: FIFO baseline, optional round-robin quantum, and Phase 5 priority."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from process.pcb import PCB, ProcessState
 
 _log = get_logger("Scheduler")
 
-PolicyName = Literal["fifo", "rr"]
+PolicyName = Literal["fifo", "rr", "priority"]
 
 
 class Scheduler:
@@ -60,10 +60,56 @@ class RoundRobinScheduler(Scheduler):
         self.quantum = quantum
 
 
+class PriorityScheduler(Scheduler):
+    """
+    Among READY processes currently in the ready queue, pick the highest ``effective_priority``.
+    Tie-break (documented): lower ``arrival_time`` first (FIFO among equals), then lower ``pid``.
+    BLOCKED / TERMINATED / missing PCBs are skipped and not re-queued here.
+    """
+
+    def pick_next(self, process_table: dict) -> Optional[PCB]:
+        staged: List[tuple[int, PCB]] = []
+        order = 0
+        while self._ready:
+            pid = self._ready.popleft()
+            pcb = process_table.get(pid)
+            if pcb is None:
+                _log(f"pick_next: stale pid={pid} removed")
+                continue
+            if pcb.state == ProcessState.TERMINATED:
+                _log(f"pick_next: skip terminated pid={pid}")
+                continue
+            if pcb.state == ProcessState.BLOCKED:
+                _log(f"pick_next: skip blocked pid={pid}")
+                continue
+            staged.append((order, pcb))
+            order += 1
+
+        if not staged:
+            _log("pick_next: ready queue empty")
+            return None
+
+        def sort_key(t: tuple[int, PCB]) -> tuple[int, int, int, int]:
+            o, p = t
+            # Higher effective_priority first; then earlier arrival; then lower pid; then queue order.
+            return (-p.effective_priority, p.arrival_time, p.pid, o)
+
+        staged.sort(key=sort_key)
+        chosen = staged[0][1]
+        _log(f"PriorityScheduler selected pid={chosen.pid} priority={chosen.effective_priority}")
+
+        for o, pcb in staged:
+            if pcb.pid != chosen.pid:
+                self._ready.append(pcb.pid)
+        return chosen
+
+
 def create_scheduler(policy: PolicyName, *, quantum: int = 2) -> Scheduler:
     """Factory: FIFO uses implicit quantum 1 in the simulator; RR carries an explicit quantum."""
     if policy == "fifo":
         return Scheduler()
     if policy == "rr":
         return RoundRobinScheduler(quantum=quantum)
+    if policy == "priority":
+        return PriorityScheduler()
     raise ValueError(f"unknown policy: {policy!r}")

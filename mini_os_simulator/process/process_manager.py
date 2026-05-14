@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from os_core.logger import get_logger
 from process.pcb import PCB, ProcessState
@@ -27,7 +27,7 @@ class ProcessManager:
         memory_required: int = 0,
         cpu_burst_time: int = 0,
         arrival_time: int = 0,
-        opened_files: Optional[List[str]] = None,
+        opened_files: Optional[List[Tuple[int, str, str]]] = None,
     ) -> PCB:
         pid = self._next_pid
         self._next_pid += 1

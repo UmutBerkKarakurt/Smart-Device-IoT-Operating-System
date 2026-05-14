@@ -42,8 +42,8 @@ def test_fifo_order() -> None:
 
 def test_file_roundtrip() -> None:
     fs = FileSystem()
-    assert fs.create("x.txt") is True
-    assert fs.write("x.txt", "hello") is True
-    assert fs.read("x.txt") == "hello"
-    assert fs.delete("x.txt") is True
-    assert fs.read("x.txt") is None
+    assert fs.create("/x.txt") is True
+    assert fs.write("/x.txt", "hello") is True
+    assert fs.read("/x.txt") == "hello"
+    assert fs.delete("/x.txt") is True
+    assert fs.read("/x.txt") is None

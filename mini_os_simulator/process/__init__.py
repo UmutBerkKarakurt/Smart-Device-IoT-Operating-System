@@ -1,8 +1,14 @@
-"""Process model: PCB, manager, FIFO scheduler."""
+"""Process model: PCB, manager, schedulers (FIFO / RR / priority)."""
 
 from process.pcb import PCB, ProcessState
 from process.process_manager import ProcessManager
-from process.scheduler import PolicyName, RoundRobinScheduler, Scheduler, create_scheduler
+from process.scheduler import (
+    PolicyName,
+    PriorityScheduler,
+    RoundRobinScheduler,
+    Scheduler,
+    create_scheduler,
+)
 
 __all__ = [
     "PCB",
@@ -10,6 +16,7 @@ __all__ = [
     "ProcessManager",
     "Scheduler",
     "RoundRobinScheduler",
+    "PriorityScheduler",
     "create_scheduler",
     "PolicyName",
 ]
